@@ -8,11 +8,14 @@ Endpoints:
   POST /api/analyze-lecture      — analyze multiple segments in sequence
 
 Pipeline per segment:
-  1. lecture_analysis_service  — content difficulty / novelty / pacing / segment_type / content_features
-  2. tribe_service             — raw cognitive intensity (TRIBE v2)
-  3. tribe_summary_service     — structured cognitive-pressure summary
-  4. mirofish_service          — 3-persona simulation (TRIBE + content-feature informed)
-  5. fusion_service            — final unified output JSON with evidence traces
+  1. lecture_analysis_service  — content analysis (LLM or heuristic)
+  2. tribe_service             — cognitive intensity (real TRIBE, text-only, or mock)
+  3. tribe_summary_service     — structured summary of TRIBE output
+  4. mirofish_service          — persona simulation (content-feature informed)
+  5. fusion_service            — final output with analysis_meta
+
+Every response now includes analysis_meta at both segment and lecture level,
+making it explicit whether real video analysis was performed.
 """
 
 from fastapi import APIRouter, HTTPException
@@ -40,7 +43,7 @@ class SegmentRequest(BaseModel):
     transcript_segment: str
     slide_text: Optional[str] = ""
     visual_context: Optional[str] = ""
-    video_path: Optional[str] = None   # passed to tribe_service if USE_REAL_TRIBE=true
+    video_path: Optional[str] = None
     previous_mean_intensity: Optional[float] = None
 
 
@@ -62,24 +65,46 @@ def analyze_segment(req: SegmentRequest):
 def analyze_lecture(req: LectureRequest):
     """
     Analyze a full lecture (list of segments) sequentially.
-    Passes previous segment's mean intensity to each subsequent segment
-    so TRIBE delta is correctly computed.
     """
     results = []
-    prev_mean = None
+    prev_tribe_mean = None
 
     for segment in req.segments:
-        result = _run_pipeline(segment, previous_mean_intensity=prev_mean)
+        result = _run_pipeline(segment, previous_mean_intensity=prev_tribe_mean)
         results.append(result)
-        prev_mean = _extract_mean_intensity(result)
+        # Feed TRIBE mean intensity (not friction_score) forward for delta computation
+        prev_tribe_mean = result.get("_tribe_mean_intensity")
+
+    # Remove internal field before returning
+    for r in results:
+        r.pop("_tribe_mean_intensity", None)
 
     fusion_service.assign_lecture_relative_flags(results)
 
     summary = _build_lecture_summary(results)
+
+    # Collect all warnings from segments
+    all_warnings = []
+    sources = set()
+    any_video_used = False
+    for r in results:
+        meta = r.get("analysis_meta", {})
+        sources.add(meta.get("tribe_source", "unknown"))
+        if meta.get("video_used"):
+            any_video_used = True
+        for w in meta.get("warnings", []):
+            if w not in all_warnings:
+                all_warnings.append(w)
+
     return {
         "segments": results,
         "lecture_summary": summary,
-        "tribe_source": results[0].get("tribe_source", "mock") if results else "mock",
+        "analysis_meta": {
+            "tribe_sources": sorted(sources),
+            "video_used": any_video_used,
+            "warnings": all_warnings,
+            "segment_count": len(results),
+        },
     }
 
 
@@ -88,7 +113,7 @@ def analyze_lecture(req: LectureRequest):
 # ---------------------------------------------------------------------------
 
 def _run_pipeline(req: SegmentRequest, previous_mean_intensity: Optional[float] = None) -> dict:
-    # Step 1: Lecture content analysis (now includes segment_type + content_features)
+    # Step 1: Content analysis
     la = lecture_analysis_service.analyze_segment(
         transcript_segment=req.transcript_segment,
         slide_text=req.slide_text or "",
@@ -96,40 +121,56 @@ def _run_pipeline(req: SegmentRequest, previous_mean_intensity: Optional[float] 
         segment_id=req.segment_id,
     )
 
-    # Pass content hints to TRIBE for better mock fidelity
     content_hints = {
         "difficulty_level": la.get("difficulty_level", "medium"),
         "conceptual_density": la.get("conceptual_density", "medium"),
+        "novelty_level": la.get("novelty_level", "medium"),
         "segment_type": la.get("segment_type", "definition"),
     }
 
-    # Step 2 + 3: TRIBE intensity → summary
+    # Step 2: TRIBE intensity (returns explicit metadata about what ran)
     tribe_output = tribe_service.get_tribe_intensity(
         video_path=req.video_path,
         transcript_text=req.transcript_segment,
         segment_id=req.segment_id,
+        previous_mean_intensity=previous_mean_intensity,
         content_hints=content_hints,
     )
+
+    # Extract TRIBE metadata before summarization strips it
+    tribe_metadata = {
+        "source": tribe_output.get("source", "unknown"),
+        "video_used": tribe_output.get("video_used", False),
+        "fallback_reason": tribe_output.get("fallback_reason"),
+        "warnings": tribe_output.get("warnings", []),
+    }
+
+    # Step 3: TRIBE summary
     tribe_summary = tribe_summary_service.summarize_tribe_output(
         tribe_output=tribe_output,
         previous_mean_intensity=previous_mean_intensity,
     )
 
-    # Step 4: MiroFish persona simulation (TRIBE + content-feature informed)
+    # Step 4: Persona simulation
     personas = mirofish_service.simulate_personas(
         lecture_analysis=la,
         tribe_summary=tribe_summary,
         segment_id=req.segment_id,
     )
 
-    # Step 5: Fusion (now includes evidence traces + segment_type + confidence float)
+    # Step 5: Fusion (now receives tribe_metadata for analysis_meta)
     result = fusion_service.fuse(
         segment_id=req.segment_id,
         time_range=req.time_range,
         lecture_analysis=la,
         tribe_summary=tribe_summary,
         mirofish_personas=personas,
+        tribe_metadata=tribe_metadata,
     )
+
+    # Carry TRIBE mean intensity forward for next segment's delta
+    # (NOT friction_score — that's a fused output, wrong signal for TRIBE delta)
+    result["_tribe_mean_intensity"] = tribe_output.get("mean_intensity")
 
     return result
 
@@ -147,7 +188,6 @@ def _build_lecture_summary(results: list) -> dict:
     least_engaging = min(results, key=lambda r: r.get("engagement_score", 1))
     most_review = max(results, key=lambda r: r.get("friction_score", 0))
 
-    # Collect segment types distribution
     type_counts = {}
     for r in results:
         st = r.get("segment_type", "unknown")
@@ -171,7 +211,3 @@ def _build_lecture_summary(results: list) -> dict:
         ),
         "segment_type_distribution": type_counts,
     }
-
-
-def _extract_mean_intensity(result: dict) -> Optional[float]:
-    return result.get("friction_score")

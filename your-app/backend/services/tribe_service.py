@@ -3,44 +3,24 @@ tribe_service.py
 
 Wrapper around TRIBE v2 (facebook/tribev2).
 
-TRIBE v2 paper corrections applied here:
-  - Output is (n_timesteps @ 1Hz) × (20,484 cortical vertices on fsaverage5 surface)
-  - Vertices are NOT named brain regions — they are surface mesh points
-  - Valid: mean across vertices (global intensity), temporal slope, approx region groupings
-  - TR = 1.0s (paper §5.3: output resampled to ffMRI = 1Hz)
-  - Subcortical: 8 regions from Harvard-Oxford atlas (8,802 voxels)
-  - Region groupings below are approximate HCP parcellation priors —
-    NOT exact atlas lookups. Labeled clearly as approximate.
+Analysis modes (explicit, never silent):
+  "tribe_v2"    — USE_REAL_TRIBE=true AND model loaded AND video provided
+  "tribe_text"  — USE_REAL_TRIBE=true AND model loaded but NO video (text-only prediction)
+  "mock"        — USE_REAL_TRIBE=false (default). Content-driven heuristic. No video analyzed.
+  "fallback"    — USE_REAL_TRIBE=true but model failed to load or inference errored.
 
-Toggle:
-    USE_REAL_TRIBE=true   → uses TribeModel from tribev2 repo
-    USE_REAL_TRIBE=false  → returns content-driven mock output (default)
-
-Output schema (identical regardless of path):
-{
-    "timeline":           list[float],   # per-TR global intensity (1Hz, normalised [0,1])
-    "timestamps":         list[float],   # seconds since segment start (0, 1, 2, ...)
-    "mean_intensity":     float,         # global mean [0,1]
-    "peak_intensity":     float,         # global peak [0,1]
-    "relative_change":    float,         # signed Δ vs previous segment mean
-    "temporal_pattern":   str,           # "rising" | "falling" | "stable" | "spike"
-    "region_activations": dict,          # approximate functional region values (see below)
-    "source":             str,           # "tribe_v2" | "mock"
-}
-
-region_activations keys (approximate, lecture-relevant, per TRIBE paper Fig 7B):
-    language_network   — auditory cortex + inferior frontal (Broca/Wernicke area)
-    prefrontal         — dorsolateral PFC, working memory / executive function proxy
-    visual_cortex      — early + ventral visual stream (V1–V4, occipital)
-    temporal_parietal  — TPJ, multisensory comprehension hub
-    default_mode       — DMN proxy (elevated = mind-wandering, inverse of engagement)
-    subcortical        — amygdala + hippocampus proxy (stress + memory encoding)
+Every response includes:
+  source:           which mode actually ran
+  video_used:       whether a real video file was read
+  fallback_reason:  why we're not in the requested mode (null if no fallback)
+  warnings:         list of human-readable caveats
 """
 
 import os
 import sys
 import logging
 import math
+import hashlib
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -53,20 +33,13 @@ _TRIBE_REPO_PATH = os.path.abspath(
 
 _model = None  # None | <model> | "FAILED"
 
-# ---------------------------------------------------------------------------
-# Approximate HCP-atlas vertex index ranges for fsaverage5 (20,484 vertices)
-# LH: 0–10241  RH: 10242–20483
-# These are rough anatomical priors from HCP parcellation literature.
-# NOT exact atlas lookups — only for visualization.
-# ---------------------------------------------------------------------------
-
 _APPROX_REGIONS = {
     "language_network":  (slice(7500, 9500),  slice(17742, 19742)),
     "prefrontal":        (slice(0, 2000),      slice(10242, 12242)),
     "visual_cortex":     (slice(9500, 10242),  slice(19742, 20483)),
     "temporal_parietal": (slice(6000, 7500),   slice(16242, 17742)),
     "default_mode":      (slice(2000, 3500),   slice(12242, 13742)),
-    "subcortical":       None,  # derived from subcortical output if available
+    "subcortical":       None,
 }
 
 
@@ -84,58 +57,109 @@ def get_tribe_intensity(
     """
     Get cognitive intensity signals for a lecture segment.
 
-    Args:
-        video_path:              path to video file
-        transcript_text:         transcript text
-        segment_id:              identifier for logging
-        previous_mean_intensity: mean intensity of previous segment (for Δ)
-        content_hints:           dict from lecture_analysis_service
-
-    Returns:
-        dict — see module docstring for full schema
+    Returns dict with explicit metadata about what mode actually ran.
     """
-    if USE_REAL_TRIBE:
-        result = _try_real_tribe(video_path, transcript_text, segment_id, previous_mean_intensity)
-        if result is not None:
-            return result
-        logger.warning("tribe_service [%s]: real TRIBE failed, falling back to mock", segment_id)
+    warnings = []
+    fallback_reason = None
+    video_used = False
+    video_exists = video_path and os.path.isfile(video_path)
 
-    return _mock_intensity(
-        transcript_text or "", segment_id, previous_mean_intensity, content_hints or {}
+    # ── Real TRIBE path ───────────────────────────────────────────────────
+    if USE_REAL_TRIBE:
+        model = _load_model()
+        if model is None:
+            fallback_reason = "TRIBE model failed to load (import error or missing weights)"
+            warnings.append("Requested real TRIBE but model is unavailable. Using fallback heuristic.")
+            logger.warning("tribe_service [%s]: %s", segment_id, fallback_reason)
+        else:
+            # Try video-based prediction first
+            if video_exists:
+                result = _try_real_tribe_video(model, video_path, segment_id, previous_mean_intensity)
+                if result is not None:
+                    result["video_used"] = True
+                    result["fallback_reason"] = None
+                    result["warnings"] = []
+                    return result
+                fallback_reason = "TRIBE inference failed on video file"
+                warnings.append(f"Video was provided but TRIBE inference failed. Using text-only prediction.")
+                logger.warning("tribe_service [%s]: video inference failed, trying text", segment_id)
+
+            # Try text-only prediction
+            if transcript_text:
+                result = _try_real_tribe_text(model, transcript_text, segment_id, previous_mean_intensity)
+                if result is not None:
+                    result["source"] = "tribe_text"
+                    result["video_used"] = False
+                    result["fallback_reason"] = "no video provided" if not video_path else "video inference failed"
+                    result["warnings"] = [
+                        "TRIBE ran on transcript text only — not video.",
+                        "Neural activation patterns are estimated from language, not audiovisual content.",
+                    ]
+                    if video_path and not video_exists:
+                        result["warnings"].append(f"video_path provided but file not found: {video_path}")
+                    return result
+
+            # Real TRIBE completely failed
+            fallback_reason = fallback_reason or "no usable input (no video, no transcript)"
+            warnings.append("Real TRIBE unavailable. Falling back to content-driven heuristic.")
+
+    else:
+        # Not even trying real TRIBE
+        fallback_reason = "USE_REAL_TRIBE=false (mock mode)"
+        if video_path:
+            warnings.append(
+                "Video file was provided but USE_REAL_TRIBE=false. "
+                "Video was NOT analyzed. Set USE_REAL_TRIBE=true to enable neural analysis."
+            )
+
+    # ── Mock / fallback path ──────────────────────────────────────────────
+    source = "fallback" if USE_REAL_TRIBE else "mock"
+    warnings.append(
+        "Results are estimated from transcript content heuristics, not neural data. "
+        "Different videos with similar transcripts may produce similar outputs."
     )
 
+    result = _mock_intensity(
+        transcript_text or "", segment_id, previous_mean_intensity, content_hints or {}
+    )
+    result["source"] = source
+    result["video_used"] = False
+    result["fallback_reason"] = fallback_reason
+    result["warnings"] = warnings
+    return result
+
 
 # ---------------------------------------------------------------------------
-# Real TRIBE v2 path
+# Real TRIBE v2 paths
 # ---------------------------------------------------------------------------
 
-def _try_real_tribe(video_path, transcript_text, segment_id, previous_mean):
-    model = _load_model()
-    if model is None:
-        return None
-
+def _try_real_tribe_video(model, video_path, segment_id, previous_mean):
     try:
-        if video_path and os.path.isfile(video_path):
-            events_df = model.get_events_dataframe(video_path=video_path)
-        elif transcript_text:
-            import pandas as pd
-            events_df = pd.DataFrame([{
-                "type": "Text",
-                "timeline": "lecture",
-                "start": 0.0,
-                "duration": max(10.0, len(transcript_text.split()) / 2.5),
-                "text": transcript_text,
-            }])
-        else:
-            return None
-
+        events_df = model.get_events_dataframe(video_path=video_path)
         result = model.predict(events=events_df)
         preds = result[0] if isinstance(result, tuple) else result
-
-        return _extract_features(preds, source="tribe_v2", previous_mean=previous_mean)
-
+        out = _extract_features(preds, source="tribe_v2", previous_mean=previous_mean)
+        return out
     except Exception as exc:
-        logger.warning("tribe_service [%s]: inference error — %s", segment_id, exc)
+        logger.warning("tribe_service [%s]: video inference error — %s", segment_id, exc)
+        return None
+
+
+def _try_real_tribe_text(model, transcript_text, segment_id, previous_mean):
+    try:
+        import pandas as pd
+        events_df = pd.DataFrame([{
+            "type": "Text",
+            "timeline": "lecture",
+            "start": 0.0,
+            "duration": max(10.0, len(transcript_text.split()) / 2.5),
+            "text": transcript_text,
+        }])
+        result = model.predict(events=events_df)
+        preds = result[0] if isinstance(result, tuple) else result
+        return _extract_features(preds, source="tribe_text", previous_mean=previous_mean)
+    except Exception as exc:
+        logger.warning("tribe_service [%s]: text inference error — %s", segment_id, exc)
         return None
 
 
@@ -168,25 +192,17 @@ def _load_model():
 
 
 def _extract_features(preds, source: str, previous_mean: Optional[float]) -> dict:
-    """
-    Extract features from real TRIBE prediction tensor.
-
-    preds shape: (n_timesteps, 20484 vertices)
-    Output is at 1Hz (TR = 1s) per paper §5.3.
-    """
     try:
         if hasattr(preds, "detach"):
             preds = preds.detach().cpu().numpy()
 
         import numpy as np
-        arr = np.abs(np.array(preds))  # (T, V)
+        arr = np.abs(np.array(preds))
 
         if arr.ndim != 2 or arr.shape[0] == 0:
             return _empty_features(source)
 
         n_timesteps, n_vertices = arr.shape
-
-        # Global timeline
         global_per_ts = arr.mean(axis=1)
         max_val = global_per_ts.max() or 1.0
         timeline = (global_per_ts / max_val).tolist()
@@ -196,18 +212,16 @@ def _extract_features(preds, source: str, previous_mean: Optional[float]) -> dic
         relative_change = (mean_val - previous_mean) if previous_mean is not None else 0.0
         temporal_pattern = _classify_temporal_pattern(timeline)
 
-        # Region activations
         if n_vertices == 20484:
             region_activations = {}
             for name, slices in _APPROX_REGIONS.items():
                 if slices is None:
-                    region_activations[name] = round(mean_val * 0.6, 4)  # subcortical proxy
+                    region_activations[name] = round(mean_val * 0.6, 4)
                     continue
                 lh_slice, rh_slice = slices
                 val = float((arr[:, lh_slice].mean() + arr[:, rh_slice].mean()) / 2.0 / max_val)
                 region_activations[name] = round(val, 4)
         else:
-            logger.warning("tribe_service: unexpected vertex count %d", n_vertices)
             region_activations = {k: round(mean_val, 4) for k in _APPROX_REGIONS}
 
         return {
@@ -256,25 +270,58 @@ def _empty_features(source: str) -> dict:
         "temporal_pattern":   "stable",
         "region_activations": {k: 0.0 for k in _APPROX_REGIONS},
         "source":             source,
+        "video_used":         False,
+        "fallback_reason":    "empty prediction tensor",
+        "warnings":           ["TRIBE returned empty predictions."],
     }
 
 
 # ---------------------------------------------------------------------------
-# Mock / content-driven path
+# Mock / content-driven path (improved variance)
 # ---------------------------------------------------------------------------
+
+def _text_hash_seed(text: str) -> float:
+    """
+    Deterministic but text-specific seed in [0, 1].
+    Different transcripts → different seeds → different mock outputs.
+    Prevents collapse to identical results for different inputs.
+    """
+    h = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+    return int(h[:8], 16) / 0xFFFFFFFF
+
 
 def _mock_intensity(text, segment_id, previous_mean, content_hints):
     """
-    Content-driven mock grounded in TRIBE paper findings (Fig 7B):
-    - Speech/text → language_network + prefrontal dominant
-    - Technical/dense → prefrontal (working memory) elevated
-    - Low novelty → default_mode elevated (mind-wandering)
-    - High difficulty → subcortical elevated (stress response)
+    Content-driven mock with per-text variance.
+
+    Key improvement: uses a hash of the transcript text as a deterministic
+    seed so that different transcripts produce measurably different outputs,
+    even when their heuristic difficulty levels are similar.
     """
     base = _heuristic_base(text, content_hints)
+    seed = _text_hash_seed(text + segment_id)
 
-    n = 12  # ~12s segment at 1Hz
-    timeline = [_clamp(base + 0.07 * math.sin(i * math.pi * 1.5 / (n - 1))) for i in range(n)]
+    # Vary timeline length based on text length (8–16 points)
+    word_count = len(text.split()) if text else 0
+    n = max(8, min(16, word_count // 5 + 8))
+
+    # Generate timeline with text-specific phase and amplitude variation
+    phase = seed * math.pi * 2
+    amp_var = 0.04 + 0.06 * seed  # amplitude varies per text
+    freq_var = 1.2 + 0.8 * seed   # frequency varies per text
+
+    timeline = []
+    for i in range(n):
+        t = i / max(n - 1, 1)
+        # Base + sine with text-specific params + secondary harmonic
+        val = base + amp_var * math.sin(t * math.pi * freq_var + phase)
+        val += 0.03 * math.sin(t * math.pi * 3.7 + phase * 2.1)
+        # Add slight trend based on content hints
+        if content_hints.get("segment_type") == "derivation":
+            val += 0.04 * t  # derivations tend to get harder
+        elif content_hints.get("segment_type") == "example":
+            val -= 0.03 * t  # examples tend to ease
+        timeline.append(_clamp(val))
 
     mean_val = sum(timeline) / n
     peak_val = max(timeline)
@@ -287,12 +334,12 @@ def _mock_intensity(text, segment_id, previous_mean, content_hints):
         "peak_intensity":     round(peak_val, 4),
         "relative_change":    round(relative_change, 4),
         "temporal_pattern":   _classify_temporal_pattern(timeline),
-        "region_activations": _mock_region_activations(text, content_hints, mean_val),
+        "region_activations": _mock_region_activations(text, content_hints, mean_val, seed),
         "source":             "mock",
     }
 
 
-def _mock_region_activations(text, hints, global_mean):
+def _mock_region_activations(text, hints, global_mean, seed):
     words = text.lower().split() if text else []
     wc = len(words)
 
@@ -317,13 +364,16 @@ def _mock_region_activations(text, hints, global_mean):
     nv  = nov_map.get(hints.get("novelty_level", "medium"), 0.55)
     den = den_map.get(hints.get("conceptual_density", "medium"), 0.48)
 
+    # Per-text perturbation so similar-difficulty texts don't collapse
+    p = (seed - 0.5) * 0.12  # ±0.06 perturbation
+
     return {
-        "language_network":  round(_clamp(0.35 + 0.25 * min(wc / 100, 1.0) + 0.15 * dv), 4),
-        "prefrontal":        round(_clamp(0.25 + 0.35 * jd + 0.20 * ed + 0.15 * dv), 4),
-        "visual_cortex":     round(_clamp(0.18 + 0.15 * ed), 4),
-        "temporal_parietal": round(_clamp(den), 4),
-        "default_mode":      round(_clamp(0.25 + 0.35 * (1.0 - nv) + 0.15 * (1.0 - dv)), 4),
-        "subcortical":       round(_clamp(0.18 + 0.25 * dv + 0.15 * nv), 4),
+        "language_network":  round(_clamp(0.35 + 0.25 * min(wc / 100, 1.0) + 0.15 * dv + p), 4),
+        "prefrontal":        round(_clamp(0.25 + 0.35 * jd + 0.20 * ed + 0.15 * dv - p * 0.5), 4),
+        "visual_cortex":     round(_clamp(0.18 + 0.15 * ed + p * 0.3), 4),
+        "temporal_parietal": round(_clamp(den + p * 0.4), 4),
+        "default_mode":      round(_clamp(0.25 + 0.35 * (1.0 - nv) + 0.15 * (1.0 - dv) - p), 4),
+        "subcortical":       round(_clamp(0.18 + 0.25 * dv + 0.15 * nv + p * 0.6), 4),
     }
 
 
@@ -340,7 +390,9 @@ def _heuristic_base(text, hints):
     jd = min(sum(1 for w in words if w in tech) / max(wc / 20, 1), 1.0)
     ls = min(wc / 150, 1.0)
     db = {"low": 0.0, "medium": 0.05, "high": 0.15}.get(hints.get("difficulty_level", "medium"), 0.05)
-    return _clamp(0.20 + 0.35 * jd + 0.15 * ls + db, lo=0.15, hi=0.85)
+    # Add text-length and unique-word variance
+    unique_ratio = len(set(words)) / max(wc, 1)
+    return _clamp(0.20 + 0.30 * jd + 0.15 * ls + db + 0.08 * unique_ratio, lo=0.15, hi=0.85)
 
 
 def _clamp(v, lo=0.0, hi=1.0):

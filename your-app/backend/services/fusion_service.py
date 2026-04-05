@@ -27,6 +27,7 @@ def fuse(
     lecture_analysis: dict,
     tribe_summary: dict,
     mirofish_personas: dict,
+    tribe_metadata: dict | None = None,
 ) -> dict:
     classification = _classify_friction(lecture_analysis, tribe_summary, mirofish_personas)
     engagement_label = _classify_engagement(lecture_analysis, tribe_summary, mirofish_personas)
@@ -47,6 +48,16 @@ def fuse(
 
     # Evidence tracing — structured signals behind the scores
     evidence = _build_evidence(lecture_analysis, tribe_summary, mirofish_personas)
+
+    # Analysis metadata — makes it impossible to miss what mode ran
+    meta = tribe_metadata or {}
+    analysis_meta = {
+        "tribe_source":     meta.get("source", tribe_summary.get("source", "unknown")),
+        "video_used":       meta.get("video_used", False),
+        "fallback_reason":  meta.get("fallback_reason"),
+        "warnings":         meta.get("warnings", []),
+        "content_analysis": "llm" if lecture_analysis.get("_llm_used") else "heuristic",
+    }
 
     return {
         "segment_id": segment_id,
@@ -71,6 +82,7 @@ def fuse(
             "persona_factors": persona_factors,
         },
         "evidence": evidence,
+        "analysis_meta": analysis_meta,
     }
 
 

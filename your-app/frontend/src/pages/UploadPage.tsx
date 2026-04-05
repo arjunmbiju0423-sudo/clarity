@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback } from 'react'
-import { Upload, FileVideo, CheckCircle, Loader2, ChevronRight, ArrowLeft } from 'lucide-react'
+import { Upload, FileVideo, CheckCircle, Loader2, ChevronRight, ArrowLeft, AlertTriangle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { GradientBackground } from '@/components/ui/gradient-background-4'
 import { cn } from '@/lib/utils'
@@ -36,6 +36,9 @@ export default function UploadPage({ onBack, onComplete }: Props) {
     if (f) handleFile(f)
   }, [handleFile])
 
+  // NOTE: This currently runs a simulated analysis with mock data.
+  // When the backend API is wired, replace this with a real fetch()
+  // to POST /api/analyze-lecture with the video file.
   const analyze = () => {
     setState('processing'); setStep(0)
     STEPS.forEach((_, i) => setTimeout(() => setStep(i + 1), (i + 1) * 900))
@@ -103,6 +106,18 @@ export default function UploadPage({ onBack, onComplete }: Props) {
                 <p className="font-semibold text-gray-900 truncate max-w-xs">{file?.name}</p>
                 <p className="mt-1 text-sm text-gray-400">{file ? (file.size / 1024 / 1024).toFixed(1) + ' MB' : ''}</p>
               </div>
+
+              {/* Demo mode notice */}
+              <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-left w-full">
+                <AlertTriangle className="h-4 w-4 mt-0.5 flex-shrink-0 text-amber-500" />
+                <div>
+                  <p className="text-xs font-semibold text-amber-700">Demo mode</p>
+                  <p className="text-xs text-amber-600">
+                    Video is not sent to the backend yet. Results shown are from content-based analysis, not neural video processing.
+                  </p>
+                </div>
+              </div>
+
               <div className="flex gap-3">
                 <Button size="lg" onClick={analyze}>
                   Analyze Lecture <ChevronRight className="h-4 w-4" />
@@ -122,7 +137,7 @@ export default function UploadPage({ onBack, onComplete }: Props) {
               </div>
               <div className="text-center">
                 <p className="font-semibold text-gray-900">Analyzing your lecture</p>
-                <p className="mt-1 text-sm text-gray-400">This takes about 30 seconds</p>
+                <p className="mt-1 text-sm text-gray-400">Running content-based analysis</p>
               </div>
               <div className="w-full max-w-xs space-y-4">
                 {STEPS.map((label, i) => (

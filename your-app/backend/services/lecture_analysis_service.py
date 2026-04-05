@@ -143,8 +143,10 @@ def analyze_segment(
 ) -> dict:
     if _ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY:
         result = _analyze_with_llm(transcript_segment, slide_text, visual_context)
+        result["_llm_used"] = True
     else:
         result = _analyze_heuristic(transcript_segment, slide_text)
+        result["_llm_used"] = False
 
     # Always compute content_features for persona simulation
     result["content_features"] = _extract_content_features(transcript_segment, slide_text, result)
