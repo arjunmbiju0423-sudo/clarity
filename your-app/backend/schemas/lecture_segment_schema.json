@@ -1,0 +1,38 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "LectureSegmentAnalysis",
+  "description": "Full input schema for the Catapult fusion analysis pipeline",
+  "type": "object",
+  "required": ["segment_id", "time_range", "transcript_segment"],
+  "properties": {
+    "segment_id": { "type": "string" },
+    "time_range": {
+      "type": "object",
+      "properties": {
+        "start": { "type": "number" },
+        "end": { "type": "number" }
+      },
+      "required": ["start", "end"]
+    },
+    "transcript_segment": { "type": "string" },
+    "slide_text": { "type": "string", "default": "" },
+    "visual_context": { "type": "string", "default": "" },
+    "lecture_analysis": {
+      "type": "object",
+      "properties": {
+        "concept": { "type": "string" },
+        "summary": { "type": "string" },
+        "is_new_concept": { "type": "boolean" },
+        "difficulty_level": { "type": "string", "enum": ["low", "medium", "high"] },
+        "conceptual_density": { "type": "string", "enum": ["low", "medium", "high"] },
+        "pacing": { "type": "string", "enum": ["slow", "moderate", "fast"] },
+        "difficulty_factors": { "type": "array", "items": { "type": "string" } },
+        "assumed_prerequisites": { "type": "array", "items": { "type": "string" } },
+        "why_this_may_be_hard": { "type": "string" },
+        "exam_importance": { "type": "string", "enum": ["low", "medium", "high"] },
+        "novelty_level": { "type": "string", "enum": ["low", "medium", "high"] },
+        "presentation_energy": { "type": "string", "enum": ["low", "medium", "high"] }
+      }
+    }
+  }
+}
